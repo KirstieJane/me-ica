@@ -34,7 +34,7 @@ before_install:
 - source activate test-env
 
 install:
-- pip install pytest coveralls pytest-cov
+- pip install pytest coverage pytest-cov codecov
 - pip install -r requirements.txt
 
 before_script:
@@ -44,12 +44,13 @@ script:
 - py.test --cov-report term-missing --cov=meica
 
 after_success:
+- codecov
 - coveralls
 
 before_cache:
 # clean unused packages & installed files from conda cache
 # this makes the cache rebuilt less frequently
-- rm -rf /home/travis/miniconda/envs/test-env
+# rm -rf /home/travis/miniconda/envs/test-env
 - conda clean --tarballs --packages --index-cache
 - rm -rf $HOME/miniconda/pkgs/cache
 

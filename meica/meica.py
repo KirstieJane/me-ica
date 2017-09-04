@@ -1,99 +1,410 @@
 #!/usr/bin/env python
 
+import re
 import os
 import sys
 import glob
-import re
 import argparse
 
-import nibabel as nib
 import numpy as np
+import nibabel as nib
+from nipype.interfaces import afni
+from nipype.interfaces.traits_extension import TraitError
+
+try:
+    FileNotFoundError
+except NameError: # working in python 2
+    FileNotFoundError = IOError
 
 
-def fparse(fname):
+def afni_fname_parse(f, echo_ind=None):
     """
-    Filename parser for NIFTI and AFNI files.
+    Filename parser for AFNI file types (.BRIK/.HEAD).
+    For AFNI file types, the space (e.g., +tlrc) is considered
+    as the file type.
 
-    Returns prefix from input datafiles (e.g., sub_001) and filetype (e.g.,
-    .nii). If AFNI format is supplied, extracts space (+tlrc, +orig, or +mni)
+    Parameters
+    ----------
+    f : string
+        the filename represented as a string
+
+    Returns
+    -------
+    prefix : str
+        the prefix for each filename, up to the echo number
+    trailing : str
+        any part of filename after echo up to extension
+    ftype : str
+        file type for the acquired functional datasets
+    """
+
+    fname      = f.split('+')[0]  # everything before the +
+    suffix     = ''.join(f.split('+')[-1:])
+    # dropping .BRIK/.HEAD, take AFNI space (e.g., +tlrc) as ftype
+    ftype      = '+' + suffix.split('.')[0]
+
+    if echo_ind is None:
+        prefix     = fname
+        trailing   = ''
+
+    elif echo_ind is not None:
+        # need to calculate indices to remove for
+        # trailing file part
+        suffix_ind = len(f) - (len(suffix) + 1)
+        prefix     = fname[:echo_ind]
+        trailing   = fname[echo_ind+1:suffix_ind]
+
+    return prefix, trailing, ftype
+
+
+def nii_fname_parse(f, echo_ind=None):
+    """
+    Filename parser for NIfTI file types (.nii; can also handle
+    gzipped nii files).
+
+    Parameters
+    ----------
+    f : string
+        the filename represented as a string
+
+    Returns
+    -------
+    prefix : str
+        the prefix for each filename, up to the echo number
+    trailing : str
+        any part of filename after echo up to extension
+    ftype : str
+        file type for the acquired functional datasets
+    """
+
+    if f.endswith('.gz'):  # if gzipped, two matches for ftype
+        fname    = '.'.join(f.split('.')[:-2])
+        ftype    = '.' + '.'.join(f.split('.')[-2:])
+
+    else:  # only one associated ftype (e.g., .nii)
+        fname    = '.'.join(f.split('.')[:-1])
+        ftype    = '.' + ''.join(f.split('.')[-1:])
+
+    if echo_ind is None:
+        prefix     = fname
+        trailing   = ''
+
+    elif echo_ind is not None:
+        # need to calculate indices to remove for
+        # trailing file part
+        ftype_ind = len(f) - len(ftype)
+        prefix   = fname[:echo_ind]
+        trailing = fname[echo_ind+1:ftype_ind]
+
+    return prefix, trailing, ftype
+
+
+def fname_parse(flist):
+    """
+    Filename parser for AFNI and NIFTI files
+
+    Returns prefix from input datafiles (e.g., sub_001), trailing file part
+    (e.g., in BIDS spec, '_bold'), and filetype extension (e.g., .nii).
+    If AFNI format is supplied, will extract space (+tlrc, +orig, or +mni)
     as filetype.
 
     Parameters
     ----------
-    fname : str
+    flist : str / list
+        list of filenames for acquired functional datasets.
+        if provided with a string, will coerce to list of length 1.
 
     Returns
     -------
-    str, str: prefix of filename, type of filename
+    prefix : str
+        the prefix for each filename, up to the echo number
+    trailing : str
+        any part of filename after echo number, up to file extension
+    ftype : str
+        extension or file type for the acquired functional datasets
     """
 
-    if '.' in fname:
-        if '+' in fname:  # i.e., if AFNI format
-            prefix = fname.split('+')[0]
-            suffix = ''.join(fname.split('+')[-1:])
-            ftype  = '+' + suffix.split('.')[0]
-        else:
-            if fname.endswith('.gz'):  # if gzipped, two matches for ftype
-                prefix = '.'.join(fname.split('.')[:-2])
-                ftype  = '.' + '.'.join(fname.split('.')[-2:])
-            else:
-                prefix = '.'.join(fname.split('.')[:-1])
-                ftype  = '.' + ''.join(fname.split('.')[-1:])
+    # find string index of echo number in filename by comparing where
+    # two file names differ. needs a single index, so if you have
+    # 10+ echos... what? how? also, then this won't work.
+    if isinstance(flist, list):
+        echo_ind = [i for i in range(len(flist[0]))
+                    if flist[0][i] != flist[1][i]][0]
+
+    elif isinstance(flist, str):
+        flist = [flist]
+        echo_ind = None
+
     else:
-        prefix = fname
-        ftype  = ''
+        print("*+ Must provide a list of files! "   +
+              "Provided with {}".format(type(flist)))
+        raise TypeError
 
-    return prefix, ftype
+    for i, f in enumerate(flist):
+
+        if '.' in f:  # if file name has an assoc. file type
+            if '+' in f:  # i.e., if AFNI format
+                prefix, trailing, ftype = afni_fname_parse(f, echo_ind)
+
+            else:
+                prefix, trailing, ftype = nii_fname_parse(f, echo_ind)
+
+        else:  # if this happens...?
+            if echo_ind is None:
+                prefix = f
+                trailing = ''
+
+            elif echo_ind is not None:
+                prefix = f[:echo_ind]
+                trailing = f[echo_ind:]
+
+            ftype  = ''
+
+    return prefix, trailing, ftype
 
 
-def format_inset(inset, tes=None, e=0):
+def nii_convert(f):
     """
-    Parse input file specification as short- or longhand.
+    Converts a given file type to a gzipped-nifti.
 
-    Given a dataset specification (usually from options.input_ds),
-    parse and create a setname for all output files. Also optionally takes
-    a label to append to all created files.
+     Parameters
+    ----------
+    fname : str
+        The full filename of the file to be converted
+
+    Returns
+    -------
+    nii_fname : str
+        The .nii.gz filename to be returned
+    """
+
+    import gzip
+    import shutil
+
+    spaces = ['+mni.', '+orig.', '+tlrc.']
+
+    if f.endswith('.nii.gz'):
+        nii_f = f
+
+    if f.endswith('.nii'):
+        try:
+            with open(f, 'rb') as in_file, gzip.open(f + '.gz', 'wb') as out_file:
+                shutil.copyfileobj(in_file, out_file)
+            nii_f = f + '.gz'
+            assert os.path.isfile(nii_f)
+            os.remove(f)
+
+        except FileNotFoundError as err:
+                print("*+ Not a valid file type for conversion! " +
+                      "Confirm file type.")
+                raise err
+
+    for s in spaces:
+        if s in f:
+            fname = f.split(s)[0]
+            space = s
+
+            afni2nii = afni.AFNItoNIFTI()
+            afni2nii.inputs.in_file = f
+            afni2nii.inputs.out_file = fname + '.nii.gz'
+            afni2nii.outputtype = 'NIFTI_GZ'
+
+            try:
+                afni2nii.run()
+                nii_f = fname + '.nii.gz'
+                os.remove(f)
+
+            except TraitError as err:
+                print("*+ Not a valid file type for conversion! " +
+                      "Confirm file type.")
+                raise err
+
+    return nii_f
+
+
+def format_dset(inset):
+    """
+    Parse input file specification as short- or longhand
+
+    Given a dataset specification (usually from options.input_ds), parse and
+    identify a file prefix, trailing file part, and file type.
+
+    Can handle 'shorthand' specification (with bash shell expansion), or
+    'longhand' specification (writing out each filename-- in either a comma-
+    separated string _OR_ a list).
 
     Parameters
     ----------
     inset : str
-    tes   : str
-    e     : echo to process, default 1
+        filenames for acquired functional datasets
 
     Returns
     -------
-    str: dataset name
-    str: name to be "set" for any output files
+    prefix : str
+        the prefix for each filename, before the echo num
+    trailing : str
+        part of filename after echo number (in BIDS spec, '_bold')
+    ftype : str
+        file type for the acquired functional datasets
     """
-    try:
-        # Parse shorthand input file specification
-        if '[' in inset:
-            fname, ftype = fparse(inset)
-            if '+' in ftype:  # if AFNI format, call .HEAD file
-                ftype = ftype + '.HEAD'
-            prefix       = re.split(r'[\[\],]',fname)[0]
-            echo_nums    = re.split(r'[\[\],]',fname)[1:-1]
-            trailing     = re.split(r'[\]+]',fname)[-1]
-            dsname       = prefix + echo_nums[e] + trailing + ftype
-            setname      = prefix + ''.join(echo_nums) + trailing
 
-        # Parse longhand input file specificiation
-        else:
+    if len(inset) == 1:
+        inset = inset[0]
+
+        if '[' in inset:  # parse shorthand file spec
+        # love this option as an end user, hate it as a dev
+            fparts = re.split(r'[\[\],]',inset)
+            datasets_in = glob.glob(fparts[0] + '*')
+
+            for i, d in enumerate(datasets_in):
+                if '.HEAD' in d:
+                    datasets_in = glob.glob(fparts[0] + '*.BRIK.gz')
+
+            prefix, trailing, ftype = fname_parse(datasets_in)
+
+        else:  # parse longhand file spec
             datasets_in   = inset.split(',')
-            prefix, ftype = fparse(datasets_in[0])
-            echo_nums     = [str(vv+1) for vv in range(len(tes))]
-            trailing      = ''
-            dsname        = datasets_in[e].strip()
-            setname       = prefix + ''.join(echo_nums[1:]) + trailing
-            assert len(echo_nums) == len(datasets_in)
+            prefix, trailing, ftype = fname_parse(datasets_in)
+
+    elif len(inset) > 1:
+            prefix, trailing, ftype = fname_parse(inset)
+
+    else:
+        print("*+ Can't understand dataset specification. " +
+                "Datasets must match format 'Dset1,Dset2,Dset3' or " +
+                "'Dset1 Dset2 Dset3'")
+        raise TypeError
+
+    return prefix, trailing, ftype
+
+
+def format_tes(tes):
+    """
+    Identify the number of echoes acquired based on the provided TEs.
+
+    Supports TE specification as comma-separated string _OR_ list.
+
+    Parameters
+    ----------
+    tes : str
+        acquired TEs
+
+    Returns
+    -------
+    echo_nums : list
+        a list of the number of echoes collected (e.g., [1, 2])
+    """
+
+    if len(tes) > 1:  # if provided with a list of tes
+        echo_nums = [str(te+1) for te in range(len(tes))]
+
+    elif len(tes) == 1: # if provided with a string of tes
+        tes = tes[0]
+        tes       = tes.split(',') # split into a list before taking range
+        echo_nums = [str(te+1) for te in range(len(tes))]
+
+    else:
+        print("*+ Can't understand TEs specification. " +
+              "TEs must match format 'TE1,TE2,TE3' or " +
+              "'TE1 TE2 TE3'")
+        raise TypeError
+
+    return echo_nums
+
+
+def format_inset(inset, tes, e=2):
+    """
+    Parse and create a setname for all output files.
+
+    Requires that files are available in the present working directory (in
+    order to assert that number of identified input datasets match the
+    specified number of echoes.)
+
+    Parameters
+    ----------
+    inset : str
+        filenames for acquired functional datasets
+    tes : str
+        acquired TEs
+    e : int
+        exemplar echo, default second acquired echo
+
+    Returns
+    -------
+    dsname : str
+        dataset name
+    setname : str
+        name to be "set" for any output files
+    """
+    echo_nums = format_tes(tes)
+    prefix, trailing, ftype = format_dset(inset)
+    index = int(e)-1
+
+    dsname    = prefix + str(echo_nums[index]) + trailing + ftype
+    setname   = prefix + ''.join(echo_nums) + trailing
+
+    if '+' in ftype:
+        datasets = glob.glob(prefix + '*' + '.BRIK.gz')
+    else:
+        datasets = glob.glob(prefix + '*')
+
+    try:
+        assert len(echo_nums) == len(datasets)
 
     except AssertionError as err:
-            print("*+ Can't understand dataset specification. "            +
-                  "Number of TEs and input datasets must be equal and "    +
-                  "matched in order. Try quotes around -d argument.")
-            raise err
+        print("*+ Can't understand input specification. "            +
+              "Number of TEs and input datasets must be equal and "  +
+              "in format 'input1,input2,input3' or "                 +
+              "'input1 input2 input3'.")
+        raise err
 
     return dsname, setname
+
+def get_dsname(inset, tes, e):
+    """
+    Return the filename for the specified echo.
+
+    Parameters
+    ----------
+    inset : str
+        filenames for acquired functional datasets
+    tes : str
+        acquired TEs in milliseconds
+    e : int
+        echo to find filename, default second acquired echo
+
+    Returns
+    -------
+    dsname : str
+        filename name of specified echo
+    """
+    dsname, _setname = format_inset(inset, tes, e)
+
+    return dsname
+
+
+def get_setname(inset, tes):
+    """
+    Return the dataset prefix for any created derivatives
+
+    Parameters
+    ----------
+    inset : str
+        filenames for acquired functional datasets
+    tes : str
+        acquired TEs in milliseconds
+    e : int
+        echo to find filename, default second acquired echo
+
+    Returns
+    -------
+    setname : str
+        prefix to be "set" for any created output files
+    """
+
+    _dsname, setname = format_inset(inset, tes, e=2)
+
+    return setname
 
 
 def check_obliquity(fname):
@@ -107,14 +418,15 @@ def check_obliquity(fname):
 
     Returns
     -------
-    float : angle from plumb (in degrees)
+    ang merit : float
+        angle from plumb (in degrees)
     """
 
     # get abbreviated affine matrix (3x3)
     aff = nib.load(fname).affine[:3,:-1]
 
     # generate offset (rads) and convert to degrees
-    fig_merit = np.min(np.sqrt((aff**2).sum(axis=0)) / np.abs(aff).max(axis=0))
+    fig_merit = np.min(np.abs(aff).max(axis=0) / np.sqrt((aff**2).sum(axis=0)))
     ang_merit = (np.arccos(fig_merit) * 180) / np.pi
 
     return ang_merit
@@ -160,19 +472,25 @@ def find_CM(fname):
     affine = im.affine * [[-1],[-1],[1],[1]]             # fix affine
     orient = np.abs(affine).argsort(axis=0)[-1,:3]       # get orientation
     affine = affine[orient]                              # reindex affine
-    cx, cy, cz = affine[:,-1] + cm * np.diag(affine)     # calculate centers
+
+    # check if dataset is oblique and get correct voxel size
+    is_oblique = check_obliquity(fname)
+    if is_oblique: zooms = np.array(im.header.get_zooms()[:3],dtype='float64')
+    else: zooms = np.diag(affine)
+
+    cx, cy, cz = affine[:,-1] + cm * zooms               # calculate centers
     cx, cy, cz = np.array([cx,cy,cz])[orient.argsort()]  # reorient centers
 
     return cx, cy, cz
 
 
-def get_options(_debug=None):
+def get_options(args):
     """
     Parses command line inputs
 
     Returns
     -------
-    argparse dic
+    parser.parse_args() : argparse dic
     """
 
     # Configure options and help dialog
@@ -181,12 +499,14 @@ def get_options(_debug=None):
     # Base processing options
     parser.add_argument('-e',
                         dest='tes',
-                        help="Echo times in ms. ex: -e 14.5,38.5,62.5",
-                        default="")
+                        nargs='+',
+                        help="Echo times in ms. ex: -e 14.5 38.5 62.5",
+                        required=True)
     parser.add_argument('-d',
                         dest='input_ds',
+                        nargs='+',
                         help="Input datasets. ex: -d RESTe[123].nii.gz",
-                        default='')
+                        required=True)
     parser.add_argument('-a',
                         dest='anat',
                         help="(Optional) anatomical dataset. " +
@@ -384,8 +704,7 @@ def get_options(_debug=None):
                          default=False)
     parser.add_argument_group(runopts)
 
-    if _debug is not None: return parser.parse_args(_debug)
-    else: return parser.parse_args()
+    return parser.parse_args(args)
 
 
 def gen_script(options):
@@ -403,24 +722,34 @@ def gen_script(options):
     """
 
     # Check for required input data
-    for echo in range(len(options.tes.split(','))):
-        dataset, _setname = format_inset(options.input_ds,
-                                         options.tes.split(','),
-                                         e=echo)
-        if not os.path.isfile(dataset):
-            raise OSError("*+ Can't find dataset {}!".format(dataset))
+    echoes = format_tes(options.tes)
+    dnames = []
+
+    for echo in echoes:
+        try:
+            dataset = get_dsname(options.input_ds,
+                                 options.tes,
+                                 e=echo)
+
+        except IndexError as err:
+            print("*+ Can't find datasets! Are they in the " +
+                  "present working directory?")
+            raise err
+
+        prefix, trailing, ftype = fname_parse(dataset)
+        dname = prefix + trailing + ftype
+        dnames.append(dname)
 
     # Set current paths, create logfile for use as shell script
     startdir  = str(os.getcwd())
     meicadir  = str(os.path.dirname(os.path.realpath(__file__)))
-    # out_ftype = '.nii.gz'  # Set NIFTI as default output filetype
 
     script_list = []
     # script_list.append('# Selected Options: ' + args)
 
     # Generate output filenames
-    _dsname, setname = format_inset(options.input_ds,
-                                    options.tes.split(','))
+    setname = get_setname(options.input_ds, options.tes)
+
     if options.label != '':
         setname = setname + options.label
 
@@ -429,14 +758,17 @@ def gen_script(options):
     # Parse timing arguments
     if options.TR is not '': tr = float(options.TR)
     else:
-        inf = nib.load(dataset).header  # Fix that function!
+        dsname  = get_dsname(options.input_ds, options.tes,e=2)
+        inf = nib.load(dsname).header
         tr  = float(round(inf.get_slice_duration() * inf.get_n_slices(),3))
 
     if 'v' in str(options.basetime):
-        basebrik   = int(options.basetime.strip('v'))
+        basetime   = int(options.basetime.strip('v'))
     elif 's' in str(options.basetime):
         timetoclip = float(options.basetime.strip('s'))
-        basebrik   = int(round(timetoclip/tr))
+        basetime   = int(round(timetoclip/tr))
+    else:
+        basetime   = options.basetime
 
     # Parse normalization, masking arguments
     if options.mni: options.space = 'MNI_caez_N27+tlrc'
@@ -450,13 +782,11 @@ def gen_script(options):
     # Parse alignment arguments
     if options.coreg_mode == 'aea': options.t2salign   = False
     elif 'lp' in options.coreg_mode : options.t2salign = True
-    # align_base         = basebrik
+    # align_base         = basetime
     align_interp       = 'cubic'
     align_interp_final = 'wsinc5'
 
     if options.anat is not '':
-        dsname, _setname   = format_inset(options.input_ds,
-                                          options.tes.split(','))
 
         img = nib.load(dsname)
         epi_cm   = find_CM(dsname)
@@ -466,10 +796,9 @@ def gen_script(options):
                     abs(epi_cm[1] - anat_cm[1]),
                     abs(epi_cm[2] - anat_cm[2])]
 
-        # cm_dist  = 20 + sum([dd**2. for dd in deltas])**.5
-        cm_dif   = max(deltas)
-        voxsz = list(img.header.get_zooms())
-        maxvoxsz = float(max(voxsz))
+        cm_dif            = max(deltas)
+        voxsz             = list(img.header.get_zooms())
+        maxvoxsz          = float(max(voxsz))
         addslabs          = abs(int(cm_dif/maxvoxsz)) + 10
         zeropad_opts      = " -I {0} -S {0} -A {0} -P {0} -L {0} -R {0} ".format(addslabs)
         oblique_anat_read = check_obliquity(options.anat) != 0
@@ -492,14 +821,14 @@ def gen_script(options):
         raise OSError("Need at least dataset inputs and TEs. Try meica.py -h")
 
     # Check for already created meica directories
-    # meicas = glob.glob('meica.*')
-    # if any(os.path.isdir(m) for i, m in enumerate(meicas)):
-    #     meica_exists   = True
-    # else: meica_exists = False
+    meicas = glob.glob('derivatives')
+    if any(os.path.isdir(m) for i, m in enumerate(meicas)):
+        meica_exists   = True
+    else: meica_exists = False
 
-    # if not options.overwrite and meica_exists:
-    #     raise OSError("*+ A ME-ICA directory already exists! " +
-    #                   "Use '--OVERWRITE' flag to overwrite it.")
+    if not options.overwrite and meica_exists:
+        raise OSError("*+ A derivatives directory already exists! " +
+                      "Use '--OVERWRITE' flag to overwrite it.")
 
     if os.getenv('DYLD_FALLBACK_LIBRARY_PATH') is None:
         raise OSError("*+ AFNI environmental variables not set! Set " +
@@ -537,32 +866,38 @@ def gen_script(options):
             options.tedica_only and
             options.select_only and
             options.export_only):
-        script_list.append('mkdir -p meica.{}'.format(setname))
+        script_list.append('mkdir -p derivatives')
 
     if options.resume:
         script_list = []
-        script_list.append('if [ ! -e '                                  +
-                           'meica.{}/_meica.orig.sh ]; '.format(setname) +
-                           'then mv '                                    +
-                           '`ls meica.{}/_meica*sh` '.format(setname)    +
-                           'meica.{}/_meica.orig.sh; fi'.format(setname))
+        script_list.append('if [ ! -e derivatives/_meica.orig.sh ]; ' +
+                           'then mv `ls derivatives/_meica*.sh` '     +
+                           'derivatives/_meica.orig.sh; fi')
 
     if not options.tedica_only and not options.select_only:
-        script_list.append("cp _meica_{0}.sh meica.{0}/".format(setname))
-    script_list.append("cd meica.{}".format(setname))
+        script_list.append("cp _meica_{}.sh derivatives/".format(setname))
 
-    echo_nums = range(len(options.tes.split(',')))
+    # Set gzip NIFTI as default filetype
+    for dname in dnames:
+        dataset = nii_convert(dname)
+        script_list.append("cp {} derivatives/".format(dataset))
+
+    script_list.append("cd derivatives")
+
+    echo_nums = format_tes(options.tes)
     ica_datasets = sorted(echo_nums)
 
     # Parse anatomical processing options, process anatomical
     if options.anat is not '':
+        mprage = nii_convert(options.anat)
+
         script_list.append("")
         script_list.append("# Deoblique, unifize, skullstrip, and/or  "      +
                            "autobox anatomical, in starting directory (may " +
                            "take a little while)")
-        ns_mprage = options.anat
-        anat_prefix, anat_ftype = fparse(options.anat)
+        anat_prefix, _anat_trailing, anat_ftype = fname_parse(mprage)
         path_anat_prefix        = "{}/{}".format(startdir,anat_prefix)
+
         if oblique_mode:
             script_list.append("if [ ! -e "                             +
                                "{}_do.nii.gz ".format(path_anat_prefix) +
@@ -570,10 +905,12 @@ def gen_script(options):
                                "{}_do.nii.gz ".format(path_anat_prefix) +
                                "-deoblique "                            +
                                "{}/{}; fi".format(startdir,
-                                                  options.anat))
+                                                  mprage))
             deobliq_anat = "{}_do.nii.gz".format(anat_prefix)
+
         else:
-            deobliq_anat = options.anat
+            deobliq_anat = mprage
+
         if not options.no_skullstrip:
             script_list.append("if [ ! -e "                                   +
                                "{}_ns.nii.gz ]; ".format(path_anat_prefix)    +
@@ -589,29 +926,31 @@ def gen_script(options):
                                "{}_ns.nii.gz; fi".format(path_anat_prefix))
             ns_mprage     = "{}_ns.nii.gz".format(anat_prefix)
 
+        elif options.no_skullstrip:
+            ns_mprage = mprage
+
     # Copy in functional datasets as NIFTI (if not in NIFTI already) and
     # calculate rigid body alignment
-    vrbase, ftype = fparse(options.input_ds)
+    vrbase, trailing, ftype = fname_parse(dsname)
     script_list.append("")
     script_list.append("# Copy in functional datasets, reset NIFTI tags " +
                        "as needed")
-    for echo in range(len(options.tes.split(','))):
-        dsname, setname = format_inset(options.input_ds, options.tes, echo)
-        script_list.append("3dcalc -a {}/{} -expr 'a' ".format(startdir,
-                                                               dsname) +
-                           "-prefix ./{}.nii".format(setname))
-        if '.nii' in ftype:
-            script_list.append("nifti_tool -mod_hdr -mod_field sform_code 1 " +
-                               "-mod_field qform_code 1 -infiles "            +
-                               "./{}.nii -overwrite".format(setname))
+    for echo in format_tes(options.tes):
+
+        dsname = get_dsname(options.input_ds, options.tes, e=echo)
+        # PK, Is this really necessary ? - ED
+        # script_list.append("nifti_tool -mod_hdr -mod_field sform_code 1 " +
+        #                    "-mod_field qform_code 1 -infiles "            +
+        #                    "./{} -overwrite".format(dsname))
 
     script_list.append("")
     script_list.append("# Calculate and save motion and obliquity "        +
                        "parameters, despiking first if not disabled, and " +
                        "separately save and mask the base volume")
+
     # Determine input to volume registration
-    vrAinput = "./{}.nii".format(format_inset(options.input_ds,
-                                              options.tes, 0)[0])
+    vrAinput = "./{}".format(get_dsname(options.input_ds, options.tes, e=1))
+
     # Compute obliquity matrix
     if oblique_mode:
         if options.anat is not '':
@@ -643,14 +982,12 @@ def gen_script(options):
     external_eBbase = False
     if options.align_base is not '':
         if options.align_base.isdigit():
-            basevol = '{}[{}]'.format(vrAinput,
-                                      options.align_base)
+            basevol = '{}[{}]'.format(vrAinput, options.align_base)
         else:
             basevol = options.align_base
             external_eBbase = True
-    else:
-        basevol = '{}[{}]'.format(vrAinput,
-                                  basebrik)
+
+    basevol = '{}[{}]'.format(vrAinput, basetime)
     script_list.append("3dcalc -a {}  -expr 'a' -prefix ".format(basevol) +
                        "eBbase.nii.gz ")
     if external_eBbase:
@@ -672,31 +1009,28 @@ def gen_script(options):
                                                          vrAinput))
     vrAinput = "./{}_vrA.nii.gz".format(setname)
     script_list.append("1dcat './{}_vrA.1D[1..6]{{{}..$}}' ".format(setname,
-                                                                    basebrik) +
+                                                                    basetime) +
                        "> motion.1D ")
-    e2dsin, _setname = format_inset(options.input_ds,
-                                    options.tes.split(','),
-                                    e=0)
+
     script_list.append("")
     script_list.append("# Preliminary preprocessing of functional datasets: " +
                        "despike, tshift, deoblique, and/or axialize")
 
     # Do preliminary preproc for this run
-    for echo in range(len(options.tes.split(','))):
-        # Determine dataset name
-        dataset, _setname = format_inset(options.input_ds,
-                                         options.tes.split(','),
-                                         e=echo)
-        dsin = 'e' + str(echo+1)
-        if echo == 0:
-            e0_dsin = dsin
+    for echo in format_tes(options.tes):
+        dataset = get_dsname(options.input_ds,
+                             options.tes,
+                             e=echo)
+        echo = int(echo)
+        dsin = 'e' + str(echo)
+        if echo == 1:
+            e1_dsin = dsin
         script_list.append("")
         script_list.append("# Preliminary preprocessing dataset " +
-                           "{} of TE=".format(dataset) +
-                           "{}ms ".format(str(options.tes.split(',')[echo])) +
+                           "{} of echo {} ".format(dataset, echo) +
                            "to produce {}_ts+orig".format(dsin))
         # Pre-treat datasets: De-spike, RETROICOR in the future?
-        pfix, ftype = fparse(dataset)
+        pfix, trailing, ftype = fname_parse(dataset)
         if not options.no_despike:
             ints_name = "./{}_pt.nii.gz".format(pfix)
             script_list.append("3dDespike -overwrite " +
@@ -739,28 +1073,30 @@ def gen_script(options):
 
     # Do preliminary preproc for this run
     stackline = []
-    for echo in range(len(options.tes.split(','))):
-        # Determine dataset name
-        dsin = 'e' + str(echo+1)
+    for echo in format_tes(options.tes):
 
-        script_list.append("3dAllineate -overwrite -final NN -NN -float "    +
-                           "-1Dmatrix_apply {}_vrmat.aff12.1D'".format(pfix) +
-                           "{%i..%i}' " % (int(basebrik),
-                                           int(basebrik)+20)     +
-                           "-base eBbase.nii.gz " +
-                           "-input {}_ts+orig'".format(dsin) +
-                           "[{:d}..{:d}]' ".format(basebrik,
-                                                   basebrik+20) +
+        dataset = get_dsname(options.input_ds, options.tes, e=echo)
+        echo = int(echo)
+        dsin = 'e' + str(echo)
+
+        script_list.append("3dAllineate -overwrite -final NN -NN -float "  +
+                           "-1Dmatrix_apply "                              +
+                           "{}_vrmat.aff12.1D'".format(setname)            +
+                           "{%i..%i}' " % (int(basetime),
+                                           int(basetime)+20)               +
+                           "-base eBbase.nii.gz "                          +
+                           "-input {}_ts+orig'".format(dsin)               +
+                           "[{}..{}]' ".format(int(basetime),
+                                                   (int(basetime)+20))     +
                            "-prefix {}_vrA.nii.gz".format(dsin))
         stackline.append("{}_vrA.nii.gz".format(dsin))
     script_list.append("3dZcat -prefix basestack.nii.gz "+
                        "{}".format(' '.join(stackline)))
     script_list.append("{} ".format(sys.executable)            +
                        "{} ".format(os.path.join(meicadir,
-                                                 'meica.libs',
                                                  't2smap.py')) +
                        "-d basestack.nii.gz "                  +
-                       "-e {}".format(options.tes))
+                       "-e {}".format(options.tes[0]))
     script_list.append("3dUnifize -prefix ./ocv_uni+orig ocv.nii")
     script_list.append("3dSkullStrip -no_avoid_eyes -prefix ./ocv_ss.nii.gz " +
                        "-overwrite -input ocv_uni+orig")
@@ -785,26 +1121,26 @@ def gen_script(options):
     # Calculate affine anatomical warp if anatomical provided, then combine
     # motion correction and coregistration parameters
     if options.anat is not '':
-        # Copy in anatomical and make sure its in +ORIG space
+        # Copy in anatomical
         script_list.append("")
         script_list.append("# Copy anatomical into ME-ICA directory and " +
                            "process warps")
-        script_list.append("cp {}/{}* .".format(startdir, ns_mprage))
-        pfix_ns_mprage, ftype_ns_mprage = fparse(ns_mprage)
+        script_list.append("cp {}/{} .".format(startdir, ns_mprage))
+        (pfix_ns_mprage,
+        trailing_ns_mprage,
+        ftype_ns_mprage) = fname_parse(ns_mprage)
+
         if options.space:
             script_list.append("afnibin_loc=`which 3dSkullStrip`")
 
             if '/' in options.space:
                 template_loc, template = os.path.split(options.space)
                 script_list.append("templateloc={}".format(template_loc))
+
             else:
                 script_list.append("templateloc=${afnibin_loc%/*}")
             at_ns_mprage = "{}_at.nii.gz".format(pfix_ns_mprage)
 
-            if 'nii' not in ftype_ns_mprage:
-                script_list.append("3dcalc -float -a {} ".format(ns_mprage) +
-                                   "-expr 'a' "                             +
-                                   "-prefix {}.nii.gz".format(pfix_ns_mprage))
             script_list.append("")
             script_list.append("# If can't find affine-warped anatomical, "   +
                                "copy native anatomical here, compute warps "  +
@@ -816,28 +1152,23 @@ def gen_script(options):
                                "then \@auto_tlrc -no_ss "                 +
                                "-init_xform AUTO_CENTER -base "           +
                                "${{templateloc}}/{} ".format(options.space) +
-                               "-input {}.nii.gz ".format(pfix_ns_mprage) +
+                               "-input {} ".format(ns_mprage) +
                                "-suffix _at")
-
-            script_list.append("cp {}.nii {}".format(pfix_ns_mprage + '_at',
-                                                     startdir))
-            script_list.append("gzip -f {}/{}.nii".format(startdir,
-                                                          pfix_ns_mprage +
-                                                          '_at'))
+            script_list.append("gzip -f {}".format(at_ns_mprage[:-3]))
+            script_list.append("cp {} {}".format(at_ns_mprage,
+                                                 startdir))
             script_list.append("else if [ ! -e {}/{} ]; ".format(startdir,
                                                                  at_ns_mprage)+
                                "then ln "                                     +
                                "-s {}/{} .; fi".format(startdir,
                                                        at_ns_mprage))
-            refanat = '{}/{}'.format(startdir,at_ns_mprage)
+            refanat = '{}/{}'.format(startdir, at_ns_mprage)
             script_list.append("fi")
 
-            script_list.append("3dcopy "                                      +
-                               "{0}/{1}.nii.gz".format(startdir,
-                                                       pfix_ns_mprage +
-                                                       '_at')+
-                               " {}".format(pfix_ns_mprage +
-                                            '_at'))
+            # script_list.append("3dcopy "                                      +
+            #                    "{0}/{1}".format(startdir,
+            #                                     at_ns_mprage)+
+            #                    " {}".format(at_ns_mprage))
 
             script_list.append("rm -f {}+orig.*; ".format(pfix_ns_mprage +
                                                           '_at') +
@@ -865,8 +1196,8 @@ def gen_script(options):
                                    "space using 3dQwarp (get lunch, takes a " +
                                    "while) ")
                 script_list.append("3dUnifize -overwrite -GM -prefix " +
-                                   "./{}u.nii.gz ".format(pfix_ns_mprage +
-                                                          '_at') +
+                                   "./{}_u.nii.gz ".format(pfix_ns_mprage +
+                                                           '_at') +
                                    "{}/{}".format(startdir,
                                                   at_ns_mprage))
                 script_list.append("3dQwarp -iwarp -overwrite -resample "             +
@@ -877,7 +1208,7 @@ def gen_script(options):
                                                           pfix_ns_mprage              +
                                                           '_atnl')                    +
                                    "-source "                                         +
-                                   "./{}u.nii.gz".format(pfix_ns_mprage               +
+                                   "./{}_u.nii.gz".format(pfix_ns_mprage               +
                                                          '_at'))
                 script_list.append("fi")
                 script_list.append("if " +
@@ -899,7 +1230,7 @@ def gen_script(options):
                 script_list.append("3daxialize -overwrite " +
                                    "-prefix ./{} {}".format(ama_alns_mprage,
                                                             alns_mprage))
-            t2salignpath = 'meica.libs/alignp_mepi_anat.py'
+            t2salignpath = 'alignp_mepi_anat.py'
             script_list.append("{} ".format(sys.executable) +
                                "{} -t ".format(os.path.join(meicadir,
                                                             t2salignpath)) +
@@ -961,7 +1292,7 @@ def gen_script(options):
     # Compute grand mean scaling factor
     script_list.append("3dBrickStat -mask eBbase.nii.gz "          +
                        "-percentile 50 1 50 "                      +
-                       "{}_ts+orig[{:d}] ".format(e0_dsin, basebrik) +
+                       "{}_ts+orig[{}] ".format(e1_dsin, basetime) +
                        "> gms.1D")
     script_list.append("gms=`cat gms.1D`; gmsa=($gms); p50=${gmsa[1]}")
 
@@ -976,15 +1307,13 @@ def gen_script(options):
     script_list.append("echo $voxdims > voxdims.1D")
     script_list.append("echo $voxsize > voxsize.1D")
 
-    for echo in range(len(options.tes.split(','))):
+    for echo in format_tes(options.tes):
 
-        # Determine dataset name
-        dataset, _setname = format_inset(options.input_ds,
-                                         options.tes.split(','),
-                                         e=echo)
-        dsin = 'e' + str(echo+1)  # Note using same dsin as in time shifting
+        dsname = get_dsname(options.input_ds, options.tes, e=echo)
+        echo = int(echo)
+        dsin = 'e' + str(echo)  # Note using same dsin as in time shifting
 
-        if echo == 0:
+        if echo == 1:
             script_list.append("")
             script_list.append("# Preparing functional masking for this " +
                                "ME-EPI run")
@@ -994,10 +1323,10 @@ def gen_script(options):
             else: almaster = ""
             # print 'almaster line is', almaster  # DEBUG
             # print 'refanat line is', refanat  # DEBUG
-            script_list.append("3dZeropad {} ".format(zeropad_opts) +
-                               "-prefix eBvrmask.nii.gz ocv_ss.nii.gz[0]")
 
             if options.anat:
+                script_list.append("3dZeropad {} ".format(zeropad_opts) +
+                               "-prefix eBvrmask.nii.gz ocv_ss.nii.gz[0]")
                 script_list.append("3dAllineate -overwrite -final NN -NN "  +
                                    "-float -1Dmatrix_apply "                +
                                    "{}_wmat.aff12.1D ".format(setname)      +
@@ -1124,7 +1453,7 @@ def gen_script(options):
                            "eBvrmask.nii.gz -input {}_ts+orig ".format(dsin) +
                            "-prefix ./{}_vr.nii.gz".format(dsin))
 
-        if echo == 0:
+        if echo == 1:
             script_list.append("3dTstat -min -prefix "            +
                                "./{}_vr_min.nii.gz ".format(dsin) +
                                "./{}_vr.nii.gz".format(dsin))
@@ -1138,7 +1467,7 @@ def gen_script(options):
         if options.FWHM=='0mm':
             script_list.append("3dcalc -float -overwrite -a eBvrmask.nii.gz " +
                                "-b ./{}_vr.nii.gz[{}..$] ".format(dsin,
-                                                                  basebrik) +
+                                                                  basetime) +
                                "-expr 'step(a)*b' "  +
                                "-prefix ./{}_sm.nii.gz ".format(dsin))
         else:
@@ -1146,7 +1475,7 @@ def gen_script(options):
                                "-mask eBvrmask.nii.gz "                       +
                                "-prefix ./{}_sm.nii.gz ".format(dsin)         +
                                "./{}_vr.nii.gz[{}..$]".format(dsin,
-                                                              basebrik))
+                                                              basetime))
 
         script_list.append("3dcalc -float -overwrite -a "       +
                            "./{}_sm.nii.gz ".format(dsin)       +
@@ -1193,7 +1522,7 @@ def gen_script(options):
     ica_mask   = "zcat_mask.nii.gz"
     zcatstring = ""
     for echo in ica_datasets:
-        dsin = 'e' + str(echo+1)
+        dsin = 'e' + str(echo)
         zcatstring = "{} ./{}_in.nii.gz".format(zcatstring,dsin)
     script_list.append("3dZcat -overwrite -prefix {} {}".format(ica_input,
                                                                 zcatstring))
@@ -1207,8 +1536,8 @@ def gen_script(options):
     strict_setting = ''
     if options.strict: strict_setting = '--strict'
 
-    if os.path.exists('{}/meica.libs'.format(meicadir)):
-        tedanapath = 'meica.libs/tedana.py'
+    if os.path.exists('{}'.format(meicadir)):
+        tedanapath = 'tedana.py'
     else: tedanapath = 'tedana.py'
 
     if not options.preproc_only:
@@ -1218,7 +1547,7 @@ def gen_script(options):
         script_list.append("{} {} ".format(sys.executable,
                                            os.path.join(meicadir,
                                                         tedanapath))   +
-                           "-e {} ".format(options.tes)                +
+                           "-e {} ".format(options.tes[0])             +
                            "-d {} ".format(ica_input)                  +
                            "--sourceTEs={} ".format(options.sourceTEs) +
                            "--kdaw={} ".format(options.daw)            +
@@ -1407,11 +1736,10 @@ def gen_script(options):
 
 
 if __name__ == '__main__':
-    options = get_options()
+    options = get_options(sys.argv[1:])
     script_list = gen_script(options)
 
-    _dsname, setname = format_inset(options.input_ds,
-                                    options.tes.split(','))
+    setname = get_setname(options.input_ds, options.tes)
     if options.label != '': setname = setname + options.label
 
     with open("_meica_{}.sh".format(setname), 'w') as file:
